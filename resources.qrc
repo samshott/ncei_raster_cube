@@ -1,0 +1,5 @@
+<RCC>
+    <qresource prefix="/plugins/ncei_raster_cube">
+        <file>resources/icon.svg</file>
+    </qresource>
+</RCC>

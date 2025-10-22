@@ -1,0 +1,19 @@
+[general]
+name=NCEI Raster Cube
+description=Build temporal raster cubes in QGIS from NOAA NCEI station and gridded datasets.
+version=0.1.0
+qgisMinimumVersion=3.22
+author=Samer & Codex
+email=
+about=NCEI Raster Cube scaffolding created via Codex to bootstrap NOAA data cube workflows.
+tracker=
+repository=
+category=Raster
+icon=resources/icon.svg
+homepage=
+changelog=Initial skeleton plugin created by Codex.
+experimental=True
+deprecated=False
+
+[author]
+name=Samer & Codex
