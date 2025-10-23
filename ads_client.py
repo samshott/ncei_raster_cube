@@ -18,6 +18,7 @@ from qgis.PyQt.QtCore import QStandardPaths, QSettings
 from .cdo_client import (
     CDORequestError,
     fetch_stations_in_bbox,
+    StationRecord,
     strip_dataset_prefix,
 )
 
@@ -44,6 +45,7 @@ class ADSFetchResult:
     preview_rows: List[Dict[str, str]]
     elapsed_ms: int
     stations: Sequence[str]
+    station_records: Sequence[StationRecord]
 
 
 def _get_cache_root() -> Path:
@@ -114,56 +116,90 @@ def fetch_ads_dataset(
     if data_types:
         params["dataTypes"] = ",".join(sorted({dt.strip() for dt in data_types if dt}))
 
+    station_records: List[StationRecord] = []
     station_id_list = list(station_ids or [])
     if not station_id_list:
-        station_id_list = _resolve_stations(
+        station_records = _resolve_station_records(
             dataset=dataset,
             start_date=start_date,
             end_date=end_date,
             bbox=bbox,
         )
+        station_id_list = strip_dataset_prefix([record.id for record in station_records if record.id])
+    else:
+        # If IDs are provided externally, we have no metadata; leave list empty.
+        station_records = []
 
     if not station_id_list:
         raise ADSRequestError(
             "No stations found in the specified extent/time window. Adjust parameters or verify dataset availability."
         )
 
-    params["stations"] = ",".join(station_id_list)
-
     headers = _headers_with_token()
     token_used = bool(headers.get("token"))
-    response = requests.get(
-        ADS_BASE_URL,
-        params=params,
-        headers=headers,
-        timeout=60,
-    )
-    elapsed_ms = int(response.elapsed.total_seconds() * 1000)
 
-    if response.status_code != 200:
-        raise ADSRequestError(
-            f"ADS request failed with HTTP {response.status_code}: {response.text[:500]}"
+    station_chunks: List[List[str]] = []
+    if station_id_list:
+        chunk_size = 100
+        station_chunks = [
+            station_id_list[i : i + chunk_size]
+            for i in range(0, len(station_id_list), chunk_size)
+        ]
+    else:
+        station_chunks = [[]]
+
+    combined_rows: List[Dict[str, str]] = []
+    source_columns: List[str] = []
+    total_elapsed_ms = 0
+
+    for chunk_index, chunk_ids in enumerate(station_chunks, start=1):
+        chunk_params = params.copy()
+        if chunk_ids:
+            chunk_params["stations"] = ",".join(chunk_ids)
+
+        response = requests.get(
+            ADS_BASE_URL,
+            params=chunk_params,
+            headers=headers,
+            timeout=60,
         )
+        total_elapsed_ms += int(response.elapsed.total_seconds() * 1000)
 
-    if response_format.lower() != "csv":
-        raise ADSRequestError(
-            f"Response format '{response_format}' not yet supported in this workflow."
-        )
+        if response.status_code != 200:
+            raise ADSRequestError(
+                f"ADS request failed with HTTP {response.status_code}: {response.text[:500]}"
+            )
 
-    text_stream = StringIO(response.text)
-    reader = csv.DictReader(text_stream)
-    source_columns = reader.fieldnames or []
-    rows: List[Dict[str, str]] = list(reader)
+        if response_format.lower() != "csv":
+            raise ADSRequestError(
+                f"Response format '{response_format}' not yet supported in this workflow."
+            )
+
+        text_stream = StringIO(response.text)
+        reader = csv.DictReader(text_stream)
+        chunk_columns = reader.fieldnames or []
+
+        if not source_columns:
+            source_columns = list(chunk_columns)
+        else:
+            for column in chunk_columns:
+                if column not in source_columns:
+                    source_columns.append(column)
+
+        combined_rows.extend(list(reader))
+
+    # Persist the full station list in params for provenance.
+    params["stations"] = ",".join(station_id_list)
 
     filtered_columns = _determine_columns(
         source_columns,
-        rows,
+        combined_rows,
         keep_columns=keep_columns,
         always_keep=always_keep,
     )
 
     filtered_rows: List[Dict[str, str]] = []
-    for row in rows:
+    for row in combined_rows:
         filtered_row: Dict[str, str] = {}
         for column in filtered_columns:
             value = row.get(column, "")
@@ -199,13 +235,14 @@ def fetch_ads_dataset(
                 "url": response.url,
                 "saved_at": timestamp,
                 "record_count": record_count,
-                "elapsed_ms": elapsed_ms,
+                "elapsed_ms": total_elapsed_ms,
                 "token_provided": token_used,
                 "columns": filtered_columns,
                 "friendly_names": {
                     column: (friendly_names or {}).get(column.upper(), column)
                     for column in filtered_columns
                 },
+                "station_count": len(station_id_list),
             },
             indent=2,
         ),
@@ -222,19 +259,20 @@ def fetch_ads_dataset(
         display_columns=display_columns,
         rows=filtered_rows,
         preview_rows=preview_rows,
-        elapsed_ms=elapsed_ms,
+        elapsed_ms=total_elapsed_ms,
         stations=station_id_list,
+        station_records=station_records,
     )
 
 
-def _resolve_stations(
+def _resolve_station_records(
     *,
     dataset: str,
     start_date: str,
     end_date: str,
     bbox: Tuple[float, float, float, float],
-) -> List[str]:
-    """Lookup station identifiers using the CDO API for the ADS dataset."""
+) -> List[StationRecord]:
+    """Lookup station metadata using the CDO API for the ADS dataset."""
     cdo_dataset = _map_ads_dataset_to_cdo(dataset)
     if not cdo_dataset:
         return []
@@ -251,8 +289,7 @@ def _resolve_stations(
             f"Station discovery via CDO failed: {err}"
         ) from err
 
-    prefixed_ids = [station.id for station in stations if station.id]
-    return strip_dataset_prefix(prefixed_ids)
+    return stations
 
 
 def _map_ads_dataset_to_cdo(dataset: str) -> Optional[str]:

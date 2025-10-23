@@ -12,7 +12,7 @@ from typing import Dict, List, Sequence
 
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
-from qgis.PyQt.QtCore import QDate, QSettings, Qt
+from qgis.PyQt.QtCore import QDate, QSettings, Qt, QVariant
 from qgis.PyQt.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -41,7 +41,13 @@ from qgis.PyQt.QtWidgets import (
 from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
+    QgsFeature,
+    QgsField,
+    QgsFields,
+    QgsGeometry,
+    QgsPointXY,
     QgsProject,
+    QgsVectorLayer,
 )
 
 from .ads_client import ADSFetchResult, ADSRequestError, fetch_ads_dataset
@@ -146,6 +152,7 @@ class ADSFetchDialog(QDialog):
 
     SETTINGS_ROOT = "ncei_raster_cube/ads_dialog"
     SETTINGS_EXPORT_DIR = "ncei_raster_cube/ads_output_dir"
+
     def __init__(self, iface, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._iface = iface
@@ -154,6 +161,7 @@ class ADSFetchDialog(QDialog):
         self._loading_preferences = True
         self._stored_selected_codes: List[str] | None = None
         self._base_type_catalog: Dict[str, str] = {}
+        self._station_layer_id: str | None = None
 
         self._build_widgets()
         self._load_preferences()
@@ -643,9 +651,10 @@ class ADSFetchDialog(QDialog):
             self._populate_preview(result)
             self._update_summary_stats(result)
             self._refresh_plot_sources(result)
+            self._update_station_layer(result)
             self._save_button.setEnabled(True)
             self._record_count_label.setText(tr("Records: {count}").format(count=result.record_count))
-            station_count = len(result.stations)
+            station_count = len(result.station_records) if result.station_records else len(result.stations)
             self._station_count_label.setText(tr("Stations: {count}").format(count=station_count))
             if station_count:
                 preview_ids = ", ".join(result.stations[:8])
@@ -767,12 +776,13 @@ class ADSFetchDialog(QDialog):
 
         start_date = result.params.get("startDate", "")
         end_date = result.params.get("endDate", "")
+        station_count = len(result.station_records) if result.station_records else len(result.stations)
         self._summary_label.setText(
             tr("Dataset: {dataset} | Date range: {start} -> {end} | Stations: {stations} | Records: {records}").format(
                 dataset=result.dataset,
                 start=start_date,
                 end=end_date,
-                stations=len(result.stations),
+                stations=station_count,
                 records=result.record_count,
             )
         )
@@ -818,6 +828,61 @@ class ADSFetchDialog(QDialog):
         self._plot_field_combo.blockSignals(False)
         self._plot_field_combo.setCurrentIndex(0)
         self._update_plot()
+
+    def _update_station_layer(self, result: ADSFetchResult) -> None:
+        """Create or refresh a point layer for the fetched stations."""
+        project = QgsProject.instance()
+
+        # Remove any previous station layer.
+        if self._station_layer_id:
+            existing = project.mapLayer(self._station_layer_id)
+            if existing:
+                project.removeMapLayer(existing.id())
+            self._station_layer_id = None
+
+        if not result.station_records:
+            return
+
+        layer = QgsVectorLayer("Point?crs=EPSG:4326", tr("ADS Stations"), "memory")
+        provider = layer.dataProvider()
+        provider.addAttributes(
+            [
+                QgsField("station_id", QVariant.String),
+                QgsField("name", QVariant.String),
+                QgsField("latitude", QVariant.Double),
+                QgsField("longitude", QVariant.Double),
+                QgsField("dataset", QVariant.String),
+                QgsField("start", QVariant.String),
+                QgsField("end", QVariant.String),
+            ]
+        )
+        layer.updateFields()
+
+        features = []
+        for record in result.station_records:
+            feature = QgsFeature()
+            feature.setGeometry(
+                QgsGeometry.fromPointXY(QgsPointXY(record.longitude, record.latitude))
+            )
+            feature.setAttributes(
+                [
+                    record.id,
+                    record.name,
+                    record.latitude,
+                    record.longitude,
+                    result.dataset,
+                    result.params.get("startDate", ""),
+                    result.params.get("endDate", ""),
+                ]
+            )
+            features.append(feature)
+
+        provider.addFeatures(features)
+        layer.updateExtents()
+
+        added_layer = project.addMapLayer(layer)
+        if added_layer:
+            self._station_layer_id = added_layer.id()
 
     def _update_plot(self) -> None:
         """Update the matplotlib plot to match the selected field."""
@@ -976,6 +1041,12 @@ class ADSFetchDialog(QDialog):
     def _reset_results(self, message: str | None = None, *, notify: bool = False) -> None:
         """Clear preview, stats, and plotting state."""
         self._last_result = None
+        if self._station_layer_id:
+            project = QgsProject.instance()
+            existing = project.mapLayer(self._station_layer_id)
+            if existing:
+                project.removeMapLayer(existing.id())
+            self._station_layer_id = None
         self._preview_table.setRowCount(0)
         self._preview_table.setColumnCount(0)
         self._preview_table.setHorizontalHeaderLabels([])

@@ -21,6 +21,7 @@ Goal: QGIS plugin that generates time-enabled raster cubes from **NCEI** data (s
 - ADS field picker exposes plain-language variable names and filters cached CSVs to selected columns.
 - ADS preview now reports summary stats, generates quick plots, and supports custom CSV export paths.
 - ADS UI enforces sane date bounds, persists user preferences, and updates labels to match selected units.
+- ADS requests chunk station lists >100 IDs and publishes a point layer of fetched stations in QGIS.
 <!-- CAPABILITIES:END -->
 
 ## Next Steps
@@ -46,6 +47,7 @@ Goal: QGIS plugin that generates time-enabled raster cubes from **NCEI** data (s
 ## Progress Log
 <!-- LOG:BEGIN -->
 - 2025-10-22 (PDT): Added pre-flight validation, compact tabbed layout, unit-aware labels, and persisted UI preferences.
+- 2025-10-22 (PDT): Added ADS station chunking plus station layer injection for spatial QA.
 - 2025-10-22 (PDT): Added ADS summary stats, plotting, trim-to-selection CSV export with persistent save path.
 - 2025-10-22 (PDT): Added friendly-name field picker, column filtering, and station-count tooltips for ADS preview.
 - 2025-10-22 (PDT): Integrated CDO station discovery into ADS fetch, added map extent helper, and improved status feedback.
