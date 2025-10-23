@@ -8,13 +8,14 @@ import shutil
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
-from qgis.PyQt.QtCore import QDate, QSettings, Qt, QVariant
+from qgis.PyQt.QtCore import QCoreApplication, QDate, QSettings, Qt, QVariant
 from qgis.PyQt.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QComboBox,
     QDateEdit,
     QDialog,
@@ -25,6 +26,7 @@ from qgis.PyQt.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMessageBox,
@@ -34,10 +36,13 @@ from qgis.PyQt.QtWidgets import (
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
     QHeaderView,
+    QProgressBar,
 )
+from qgis.gui import QgsMapLayerComboBox, QgsProjectionSelectionWidget
 from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
@@ -45,12 +50,16 @@ from qgis.core import (
     QgsField,
     QgsFields,
     QgsGeometry,
+    QgsMapLayerProxyModel,
     QgsPointXY,
     QgsProject,
+    QgsRasterLayer,
+    QgsRectangle,
     QgsVectorLayer,
 )
 
 from .ads_client import ADSFetchResult, ADSRequestError, fetch_ads_dataset
+from . import gridder
 from .settings import tr as tr_settings
 
 
@@ -262,6 +271,77 @@ class ADSFetchDialog(QDialog):
         self._plot_status_label = QLabel()
         self._plot_status_label.setAlignment(Qt.AlignCenter)
 
+        # Grid/output widgets -------------------------------------------------
+        self._grid_variable_combo = QComboBox()
+        self._grid_variable_combo.setEnabled(False)
+
+        self._grid_output_line = QLineEdit()
+        self._grid_output_line.setPlaceholderText(tr("Choose output directory..."))
+        self._grid_output_browse = QPushButton(tr("Browse…"))
+
+        self._grid_crs_widget = QgsProjectionSelectionWidget()
+        self._grid_crs_widget.setCrs(QgsCoordinateReferenceSystem("EPSG:3857"))
+
+        self._grid_resolution_spin = QDoubleSpinBox()
+        self._grid_resolution_spin.setRange(0.1, 100000.0)
+        self._grid_resolution_spin.setDecimals(2)
+        self._grid_resolution_spin.setValue(1000.0)
+
+        self._grid_extent_combo = QComboBox()
+        self._grid_extent_combo.addItems([tr("Current map extent"), tr("Polygon layer")])
+        self._grid_aoi_combo = QgsMapLayerComboBox()
+        self._grid_aoi_combo.setFilters(QgsMapLayerProxyModel.PolygonLayer)
+        self._grid_aoi_combo.setVisible(False)
+
+        self._grid_buffer_spin = QSpinBox()
+        self._grid_buffer_spin.setRange(0, 50)
+        self._grid_buffer_spin.setValue(3)
+
+        self._grid_power_spin = QDoubleSpinBox()
+        self._grid_power_spin.setRange(0.1, 10.0)
+        self._grid_power_spin.setSingleStep(0.1)
+        self._grid_power_spin.setValue(2.0)
+
+        self._grid_min_points_spin = QSpinBox()
+        self._grid_min_points_spin.setRange(1, 50)
+        self._grid_min_points_spin.setValue(3)
+
+        self._grid_auto_radius_check = QCheckBox(tr("Auto search radius (× cell size)"))
+        self._grid_auto_radius_check.setChecked(True)
+        self._grid_auto_radius_multiplier_spin = QDoubleSpinBox()
+        self._grid_auto_radius_multiplier_spin.setRange(1.0, 10.0)
+        self._grid_auto_radius_multiplier_spin.setSingleStep(0.5)
+        self._grid_auto_radius_multiplier_spin.setValue(3.0)
+
+        self._grid_radius_spin = QDoubleSpinBox()
+        self._grid_radius_spin.setRange(1.0, 1000000.0)
+        self._grid_radius_spin.setDecimals(2)
+        self._grid_radius_spin.setValue(3000.0)
+        self._grid_radius_spin.setEnabled(False)
+
+        self._grid_skip_sparse_check = QCheckBox(tr("Skip slices with < min stations"))
+        self._grid_skip_sparse_check.setChecked(True)
+        self._grid_derive_tavg_check = QCheckBox(tr("Derive TAVG from TMIN/TMAX when missing"))
+        self._grid_clip_check = QCheckBox(tr("Clip outputs to AOI polygon"))
+        self._grid_clip_check.setChecked(True)
+        self._grid_cog_check = QCheckBox(tr("Create Cloud Optimized GeoTIFF (COG) copies"))
+        self._grid_qa_check = QCheckBox(tr("Write coverage CSV (QA)"))
+        self._grid_qa_check.setChecked(True)
+        self._grid_add_to_map_check = QCheckBox(tr("Add VRT to map when complete"))
+        self._grid_add_to_map_check.setChecked(False)
+
+        self._grid_run_button = QPushButton(tr("Build Raster Cube"))
+        self._grid_run_button.setEnabled(False)
+
+        self._grid_progress_bar = QProgressBar()
+        self._grid_progress_bar.setMinimum(0)
+        self._grid_progress_bar.setMaximum(100)
+        self._grid_progress_bar.setValue(0)
+
+        self._grid_log = QTextEdit()
+        self._grid_log.setReadOnly(True)
+        self._grid_log.setMinimumHeight(140)
+
         # Layout ---------------------------------------------------------------
         command_row = QHBoxLayout()
         command_row.addWidget(self._fetch_button)
@@ -283,6 +363,7 @@ class ADSFetchDialog(QDialog):
         self._tab_widget.addTab(self._create_preview_tab(), tr("Preview"))
         self._tab_widget.addTab(self._create_summary_tab(), tr("Summary"))
         self._tab_widget.addTab(self._create_plot_tab(), tr("Plot"))
+        self._tab_widget.addTab(self._create_grid_tab(), tr("Grid & Output"))
 
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
@@ -298,6 +379,10 @@ class ADSFetchDialog(QDialog):
         main_layout.addLayout(command_row)
         main_layout.addWidget(splitter, stretch=1)
         main_layout.addWidget(self._status_label)
+
+        self._update_grid_extent_controls()
+        self._update_radius_controls()
+        self._update_grid_run_state()
 
     def _connect_signals(self) -> None:
         """Wire widget signals."""
@@ -315,6 +400,12 @@ class ADSFetchDialog(QDialog):
         self._save_button.clicked.connect(self._handle_save_csv)
         self._start_date.dateChanged.connect(self._on_start_date_changed)
         self._end_date.dateChanged.connect(self._on_end_date_changed)
+        self._grid_extent_combo.currentIndexChanged.connect(self._update_grid_extent_controls)
+        self._grid_output_browse.clicked.connect(self._browse_output_folder)
+        self._grid_auto_radius_check.toggled.connect(self._update_radius_controls)
+        self._grid_variable_combo.currentIndexChanged.connect(self._update_grid_run_state)
+        self._grid_output_line.textChanged.connect(lambda _: self._update_grid_run_state())
+        self._grid_run_button.clicked.connect(self._on_run_grid)
 
     # ----------------------------------------------------------------- Helpers --
     def _make_coord_spin(self, maximum: float, *, default: float) -> QDoubleSpinBox:
@@ -399,6 +490,233 @@ class ADSFetchDialog(QDialog):
         layout.addWidget(self._canvas, stretch=1)
         layout.addWidget(self._plot_status_label)
         return container
+
+    def _create_grid_tab(self) -> QWidget:
+        """Create the gridding configuration tab."""
+        container = QWidget()
+        layout = QVBoxLayout(container)
+
+        form = QFormLayout()
+        form.addRow(tr("Variable"), self._grid_variable_combo)
+
+        output_widget = QWidget()
+        output_layout = QHBoxLayout(output_widget)
+        output_layout.setContentsMargins(0, 0, 0, 0)
+        output_layout.addWidget(self._grid_output_line)
+        output_layout.addWidget(self._grid_output_browse)
+        form.addRow(tr("Output directory"), output_widget)
+
+        form.addRow(tr("Target CRS"), self._grid_crs_widget)
+        form.addRow(tr("Cell size (target units)"), self._grid_resolution_spin)
+
+        extent_widget = QWidget()
+        extent_layout = QHBoxLayout(extent_widget)
+        extent_layout.setContentsMargins(0, 0, 0, 0)
+        extent_layout.addWidget(self._grid_extent_combo)
+        extent_layout.addWidget(self._grid_aoi_combo)
+        form.addRow(tr("Extent"), extent_widget)
+
+        form.addRow(tr("Buffer (cells)"), self._grid_buffer_spin)
+        form.addRow(tr("IDW power"), self._grid_power_spin)
+        form.addRow(tr("Minimum stations"), self._grid_min_points_spin)
+
+        radius_widget = QWidget()
+        radius_layout = QHBoxLayout(radius_widget)
+        radius_layout.setContentsMargins(0, 0, 0, 0)
+        radius_layout.addWidget(self._grid_auto_radius_check)
+        radius_layout.addWidget(QLabel(tr("Multiplier")))
+        radius_layout.addWidget(self._grid_auto_radius_multiplier_spin)
+        radius_layout.addSpacing(12)
+        radius_layout.addWidget(QLabel(tr("Manual radius")))
+        radius_layout.addWidget(self._grid_radius_spin)
+        form.addRow(tr("Search radius"), radius_widget)
+
+        layout.addLayout(form)
+        layout.addWidget(self._grid_skip_sparse_check)
+        layout.addWidget(self._grid_derive_tavg_check)
+        layout.addWidget(self._grid_clip_check)
+        layout.addWidget(self._grid_cog_check)
+        layout.addWidget(self._grid_qa_check)
+        layout.addWidget(self._grid_add_to_map_check)
+
+        layout.addWidget(self._grid_run_button)
+        layout.addWidget(self._grid_progress_bar)
+        layout.addWidget(self._grid_log)
+        layout.addStretch(1)
+
+        return container
+
+    def _update_grid_extent_controls(self) -> None:
+        use_layer = self._grid_extent_combo.currentIndex() == 1
+        self._grid_aoi_combo.setVisible(use_layer)
+        if not use_layer:
+            self._grid_clip_check.setChecked(False)
+        else:
+            self._grid_clip_check.setChecked(True)
+        self._grid_clip_check.setEnabled(use_layer)
+
+    def _update_radius_controls(self) -> None:
+        auto = self._grid_auto_radius_check.isChecked()
+        self._grid_auto_radius_multiplier_spin.setEnabled(auto)
+        self._grid_radius_spin.setEnabled(not auto)
+
+    def _browse_output_folder(self) -> None:
+        start_dir = self._grid_output_line.text().strip() or str(Path.home())
+        directory = QFileDialog.getExistingDirectory(self, tr("Select output folder"), start_dir)
+        if directory:
+            self._grid_output_line.setText(directory)
+        self._update_grid_run_state()
+
+    def _append_grid_log(self, message: str) -> None:
+        self._grid_log.append(message)
+
+    def _populate_grid_variable_combo(self, result: ADSFetchResult) -> None:
+        available = [code for code in self._selected_data_types() if code.upper() in result.columns]
+        self._grid_variable_combo.blockSignals(True)
+        self._grid_variable_combo.clear()
+        if available:
+            for code in available:
+                self._grid_variable_combo.addItem(self._unit_label(code.upper()), code.upper())
+            self._grid_variable_combo.setEnabled(True)
+        else:
+            self._grid_variable_combo.addItem(tr("No variables available"), "")
+            self._grid_variable_combo.setEnabled(False)
+        self._grid_variable_combo.blockSignals(False)
+        self._update_grid_run_state()
+
+    def _update_grid_run_state(self) -> None:
+        has_result = self._last_result is not None
+        variable_selected = bool(self._grid_variable_combo.currentData())
+        output_dir = bool(self._grid_output_line.text().strip())
+        self._grid_run_button.setEnabled(has_result and variable_selected and output_dir)
+
+    def _determine_grid_extent(
+        self,
+        target_crs: QgsCoordinateReferenceSystem,
+    ) -> Tuple[QgsRectangle, Optional[QgsVectorLayer]]:
+        transform_context = QgsProject.instance().transformContext()
+        canvas = self._iface.mapCanvas()
+        if self._grid_extent_combo.currentIndex() == 0:
+            rect = QgsRectangle(canvas.extent())
+            canvas_crs = canvas.mapSettings().destinationCrs()
+            if canvas_crs != target_crs:
+                transform = QgsCoordinateTransform(canvas_crs, target_crs, transform_context)
+                rect = transform.transformBoundingBox(rect)
+            return rect, None
+
+        layer = self._grid_aoi_combo.currentLayer()
+        if not layer:
+            raise gridder.GridError("Select a polygon AOI layer for the grid extent.")
+
+        rect = QgsRectangle(layer.extent())
+        if layer.crs() != target_crs:
+            transform = QgsCoordinateTransform(layer.crs(), target_crs, transform_context)
+            rect = transform.transformBoundingBox(rect)
+        return rect, layer
+
+    def _on_run_grid(self) -> None:
+        if not self._last_result:
+            QMessageBox.information(self, tr("No Data"), tr("Fetch data before building a raster cube."))
+            return
+
+        variable_code = self._grid_variable_combo.currentData()
+        if not variable_code:
+            QMessageBox.information(self, tr("No Variable"), tr("Select a variable to grid."))
+            return
+
+        output_dir_path = self._grid_output_line.text().strip()
+        if not output_dir_path:
+            QMessageBox.information(self, tr("Output Required"), tr("Choose an output directory."))
+            return
+
+        try:
+            output_dir = Path(output_dir_path)
+        except Exception as exc:  # pylint: disable=broad-except
+            QMessageBox.critical(self, tr("Invalid Path"), str(exc))
+            return
+
+        target_crs = self._grid_crs_widget.crs()
+        try:
+            extent_rect, clip_layer = self._determine_grid_extent(target_crs)
+        except gridder.GridError as exc:
+            QMessageBox.critical(self, tr("Extent Error"), str(exc))
+            return
+
+        params = gridder.GridParameters(
+            variable=variable_code,
+            variable_label=self._grid_variable_combo.currentText(),
+            target_crs=target_crs,
+            resolution=self._grid_resolution_spin.value(),
+            buffer_cells=self._grid_buffer_spin.value(),
+            extent_rect=extent_rect,
+            clip_layer=clip_layer,
+            clip_enabled=self._grid_clip_check.isChecked() and clip_layer is not None,
+            auto_radius=self._grid_auto_radius_check.isChecked(),
+            radius=self._grid_radius_spin.value(),
+            auto_radius_multiplier=self._grid_auto_radius_multiplier_spin.value(),
+            idw_power=self._grid_power_spin.value(),
+            idw_min_points=self._grid_min_points_spin.value(),
+            skip_sparse_slices=self._grid_skip_sparse_check.isChecked(),
+            derive_average_temperature=self._grid_derive_tavg_check.isChecked(),
+            output_dir=output_dir,
+            write_vrt=True,
+            write_cog=self._grid_cog_check.isChecked(),
+            write_qa=self._grid_qa_check.isChecked(),
+        )
+
+        self._grid_log.clear()
+        self._grid_progress_bar.setValue(0)
+        self._grid_run_button.setEnabled(False)
+        self._append_grid_log(tr("Starting raster cube build..."))
+
+        def progress_cb(percent: int, message: str) -> None:
+            self._grid_progress_bar.setValue(percent)
+            if message:
+                self._append_grid_log(message)
+            QCoreApplication.processEvents()
+
+        try:
+            outputs = gridder.build_raster_cube(self._last_result, params, progress_cb)
+        except gridder.GridError as exc:
+            QMessageBox.critical(self, tr("Gridding Failed"), str(exc))
+            self._append_grid_log(tr("Gridding failed: {msg}").format(msg=str(exc)))
+            self._grid_progress_bar.setValue(0)
+            self._update_grid_run_state()
+            return
+        except Exception as exc:  # pylint: disable=broad-except
+            QMessageBox.critical(self, tr("Unexpected Error"), str(exc))
+            self._append_grid_log(tr("Unexpected error: {msg}").format(msg=str(exc)))
+            self._grid_progress_bar.setValue(0)
+            self._update_grid_run_state()
+            return
+
+        self._append_grid_log(
+            tr("Generated {count} raster slice(s) for {variable}.").format(
+                count=len(outputs.tif_paths),
+                variable=outputs.variable_label,
+            )
+        )
+        if outputs.coverage_csv:
+            self._append_grid_log(tr("Coverage CSV: {path}").format(path=str(outputs.coverage_csv)))
+        if outputs.vrt_path:
+            self._append_grid_log(tr("VRT: {path}").format(path=str(outputs.vrt_path)))
+        for warning in outputs.warnings:
+            self._append_grid_log(tr("Warning: {msg}").format(msg=warning))
+
+        if outputs.vrt_path and self._grid_add_to_map_check.isChecked():
+            layer_name = f"{outputs.variable_label} cube"
+            raster_layer = QgsRasterLayer(str(outputs.vrt_path), layer_name)
+            if raster_layer.isValid():
+                QgsProject.instance().addMapLayer(raster_layer)
+                self._append_grid_log(
+                    tr("Added VRT to map. Configure temporal settings via Layer Properties ▸ Temporal.")
+                )
+            else:
+                self._append_grid_log(tr("Warning: VRT layer invalid; not added to map."))
+
+        self._set_status(tr("Raster cube generated successfully."), "success")
+        self._grid_progress_bar.setValue(100)
+        self._update_grid_run_state()
     # --------------------------------------------------------------- Preferences --
     def _load_preferences(self) -> None:
         """Apply persisted preferences to widgets."""
@@ -498,6 +816,8 @@ class ADSFetchDialog(QDialog):
             return
         self._reset_results(tr("Field selection changed. Fetch preview again to refresh."), notify=True)
         self._persist_preferences()
+        if self._last_result:
+            self._populate_grid_variable_combo(self._last_result)
 
     def _on_start_date_changed(self, qdate: QDate) -> None:
         self._end_date.blockSignals(True)
@@ -627,6 +947,8 @@ class ADSFetchDialog(QDialog):
         if not self._loading_preferences:
             self._reset_results(tr("Field selection changed. Fetch preview again to refresh."), notify=True)
             self._persist_preferences()
+            if self._last_result:
+                self._populate_grid_variable_combo(self._last_result)
 
     def _clear_data_type_selection(self) -> None:
         """Uncheck all data types."""
@@ -639,6 +961,8 @@ class ADSFetchDialog(QDialog):
         if not self._loading_preferences:
             self._reset_results(tr("Field selection changed. Fetch preview again to refresh."), notify=True)
             self._persist_preferences()
+            if self._last_result:
+                self._populate_grid_variable_combo(self._last_result)
     # -------------------------------------------------------------- Fetch workflow --
     def _on_fetch_clicked(self) -> None:
         """Trigger the ADS fetch workflow."""
@@ -652,6 +976,7 @@ class ADSFetchDialog(QDialog):
             self._update_summary_stats(result)
             self._refresh_plot_sources(result)
             self._update_station_layer(result)
+            self._populate_grid_variable_combo(result)
             self._save_button.setEnabled(True)
             self._record_count_label.setText(tr("Records: {count}").format(count=result.record_count))
             station_count = len(result.station_records) if result.station_records else len(result.stations)
@@ -669,12 +994,15 @@ class ADSFetchDialog(QDialog):
                 "success",
             )
             self._persist_preferences()
+            self._update_grid_run_state()
         except ADSRequestError as exc:
             self._reset_results()
             self._set_status(str(exc), "error")
+            self._update_grid_run_state()
         except Exception as exc:  # pylint: disable=broad-except
             self._reset_results()
             self._set_status(tr("Unexpected error: {msg}").format(msg=str(exc)), "error")
+            self._update_grid_run_state()
         finally:
             self._fetch_button.setEnabled(True)
 
@@ -1062,6 +1390,13 @@ class ADSFetchDialog(QDialog):
         self._station_count_label.setText(tr("Stations: --"))
         self._station_count_label.setToolTip("")
         self._save_button.setEnabled(False)
+        self._grid_variable_combo.blockSignals(True)
+        self._grid_variable_combo.clear()
+        self._grid_variable_combo.blockSignals(False)
+        self._grid_variable_combo.setEnabled(False)
+        self._grid_progress_bar.setValue(0)
+        self._grid_log.clear()
+        self._update_grid_run_state()
         if notify and not self._loading_preferences:
             self._set_status(message or tr("Parameters changed. Fetch preview again to refresh."), "info")
 
