@@ -1,4 +1,4 @@
-"""
+﻿"""
 Utilities for gridding station time-series data into temporal raster cubes.
 """
 
@@ -14,14 +14,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
+import numpy as np
 from osgeo import gdal
 from qgis.PyQt.QtCore import QVariant
 from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
     QgsFeature,
-    QgsFields,
     QgsField,
+    QgsFields,
     QgsGeometry,
     QgsPointXY,
     QgsProject,
@@ -50,6 +51,7 @@ class GridParameters:
     extent_rect: QgsRectangle
     clip_layer: Optional[QgsVectorLayer]
     clip_enabled: bool
+    method: str
     auto_radius: bool
     radius: float
     auto_radius_multiplier: float
@@ -57,6 +59,9 @@ class GridParameters:
     idw_min_points: int
     skip_sparse_slices: bool
     derive_average_temperature: bool
+    log_transform: bool
+    burn_stations: bool
+    burn_radius_cells: float
     output_dir: Path
     write_vrt: bool
     write_cog: bool
@@ -74,6 +79,7 @@ class GridOutputs:
     coverage_csv: Optional[Path]
     cog_paths: List[Path]
     warnings: List[str]
+    band_labels: List[str]
 
 
 class GridError(RuntimeError):
@@ -85,9 +91,8 @@ def build_raster_cube(
     params: GridParameters,
     progress_cb: Optional[ProgressCallback] = None,
 ) -> GridOutputs:
-    """
-    Convert station data to a stack of rasters (one per time slice).
-    """
+    """Convert station data to a stack of rasters (one per time slice)."""
+
     if progress_cb:
         progress_cb(0, "Preparing gridding inputs...")
 
@@ -100,12 +105,21 @@ def build_raster_cube(
         raise GridError("Target CRS is invalid.")
 
     resolution = max(params.resolution, 0.0001)
+    method_uses_radius = params.method in {"idw", "nearest", "average", "gwr"}
+    search_radius = params.radius if not params.auto_radius else (params.auto_radius_multiplier * resolution)
+    if method_uses_radius:
+        search_radius = max(search_radius, resolution)
+    else:
+        search_radius = 0.0
+
+    radius_buffer_cells = math.ceil(search_radius / resolution) if method_uses_radius else 0
+    buffer_cells = max(params.buffer_cells, radius_buffer_cells)
 
     base_extent = QgsRectangle(params.extent_rect)
     if not base_extent.isFinite():
         raise GridError("Grid extent is invalid or empty.")
 
-    buffer_distance = max(params.buffer_cells, 0) * resolution
+    buffer_distance = buffer_cells * resolution
     buffered_extent = _expanded_rect(base_extent, buffer_distance)
 
     transform_context = QgsProject.instance().transformContext()
@@ -140,29 +154,28 @@ def build_raster_cube(
         cog_paths: List[Path] = []
         warnings: List[str] = []
         coverage_rows: List[Tuple[str, int, Optional[float], Optional[float], Optional[float], Optional[float]]] = []
+        band_labels: List[str] = []
 
         grid_width, grid_height = _grid_dimensions(buffered_extent, resolution)
         if grid_width <= 0 or grid_height <= 0:
             raise GridError("Computed grid size is zero; adjust resolution or extent.")
 
-        auto_radius = params.auto_radius_multiplier * resolution
-        search_radius = params.radius if not params.auto_radius else auto_radius
-
         for index, date_key in enumerate(date_keys, start=1):
-            slice_points = values_by_date[date_key]
-            station_values: List[Tuple[float, float, float]] = []
+            raw_entries: List[Tuple[float, float, float]] = []
 
-            for station_id, value in slice_points:
+            for station_id, value in values_by_date[date_key]:
                 record = station_map.get(station_id)
+                coords = None
                 if record:
-                    station_values.append((record.longitude, record.latitude, value))
+                    coords = (record.longitude, record.latitude)
                 else:
-                    fallback = _extract_coordinates_from_rows(result.rows, station_id)
-                    if fallback:
-                        station_values.append((*fallback, value))
+                    coords = _extract_coordinates_from_rows(result.rows, station_id)
+                if coords is None:
+                    continue
+                raw_entries.append((coords[0], coords[1], value))
 
-            station_count = len(station_values)
-            stats = _compute_statistics([v for _, _, v in station_values])
+            station_count = len(raw_entries)
+            stats = _compute_statistics([entry[2] for entry in raw_entries])
             coverage_rows.append(
                 (
                     date_key,
@@ -190,21 +203,51 @@ def build_raster_cube(
                 if params.skip_sparse_slices:
                     continue
                 _create_empty_raster(dest_path, buffered_extent, resolution, grid_width, grid_height, target_crs, nodata)
-            else:
-                _grid_slice(
-                    station_values,
+                _trim_to_extent(dest_path, base_extent, target_crs, nodata)
+                if clip_layer_path and params.clip_enabled:
+                    _clip_to_polygon(dest_path, clip_layer_path, target_crs, nodata)
+                tif_paths.append(dest_path)
+                band_labels.append(date_key)
+                if params.write_cog:
+                    cog_path = cog_dir / output_name
+                    _translate_to_cog(dest_path, cog_path)
+                    cog_paths.append(cog_path)
+                continue
+
+            vector_path, transformed_points = _create_station_layer(
+                raw_entries,
+                params.log_transform,
+                tmp_dir,
+                target_crs,
+                transform_context,
+                date_key,
+            )
+
+            if params.method == "gwr":
+                _grid_slice_gwr(
+                    transformed_points,
                     dest_path,
-                    tmp_dir,
                     buffered_extent,
                     target_crs,
                     resolution,
                     grid_width,
                     grid_height,
                     nodata,
-                    params.idw_power,
+                    params,
                     search_radius,
-                    params.idw_min_points,
-                    transform_context,
+                )
+            else:
+                _grid_slice(
+                    vector_path,
+                    dest_path,
+                    buffered_extent,
+                    target_crs,
+                    resolution,
+                    grid_width,
+                    grid_height,
+                    nodata,
+                    params,
+                    search_radius,
                 )
 
             _trim_to_extent(dest_path, base_extent, target_crs, nodata)
@@ -212,19 +255,32 @@ def build_raster_cube(
             if clip_layer_path and params.clip_enabled:
                 _clip_to_polygon(dest_path, clip_layer_path, target_crs, nodata)
 
+            if params.log_transform:
+                _apply_inverse_transform(dest_path, nodata)
+
+            if params.burn_stations:
+                burn_distance = max(params.burn_radius_cells, 0.0) * resolution
+                _burn_station_values(dest_path, vector_path, burn_distance, tmp_dir, transform_context)
+
             tif_paths.append(dest_path)
+            band_labels.append(date_key)
 
             if params.write_cog:
                 cog_path = cog_dir / output_name
                 _translate_to_cog(dest_path, cog_path)
                 cog_paths.append(cog_path)
 
+        if not tif_paths:
+            raise GridError(
+                "No rasters were generated. Reduce the minimum station requirement or verify station coverage."
+            )
+
         vrt_path: Optional[Path] = None
         if params.write_vrt and tif_paths:
             if progress_cb:
                 progress_cb(90, "Building VRT...")
             vrt_path = variable_dir / f"{variable.lower()}_cube.vrt"
-            _build_vrt(tif_paths, vrt_path)
+            _build_vrt(tif_paths, vrt_path, band_labels)
 
         coverage_csv: Optional[Path] = None
         if params.write_qa and coverage_rows:
@@ -242,6 +298,7 @@ def build_raster_cube(
             coverage_csv=coverage_csv,
             cog_paths=cog_paths,
             warnings=warnings,
+            band_labels=band_labels,
         )
 
 
@@ -286,24 +343,30 @@ def _group_rows_by_date(
         if not date_value:
             continue
 
-        raw = row.get(variable_upper)
+        raw_entry = row.get(variable_upper)
         value: Optional[float] = None
-        if raw is not None and raw != "":
+        if raw_entry not in (None, ""):
             try:
-                value = float(raw)
+                numeric = float(raw_entry)
             except ValueError:
-                value = None
-        elif (
-            params.derive_average_temperature
-            and variable_upper == "TAVG"
-        ):
+                numeric = None
+            else:
+                if params.log_transform and numeric < 0:
+                    numeric = None
+                value = numeric
+
+        if value is None and params.derive_average_temperature and variable_upper == "TAVG":
             tmin = row.get("TMIN")
             tmax = row.get("TMAX")
             if tmin not in (None, "") and tmax not in (None, ""):
                 try:
-                    value = (float(tmin) + float(tmax)) / 2.0
+                    numeric = (float(tmin) + float(tmax)) / 2.0
                 except ValueError:
-                    value = None
+                    numeric = None
+                else:
+                    if params.log_transform and numeric < 0:
+                        numeric = None
+                    value = numeric
 
         if value is None:
             continue
@@ -355,7 +418,7 @@ def _export_layer_to_gpkg(
     temp_dir: Path,
     transform_context,
 ) -> Path:
-    path = temp_dir / "clip_layer.gpkg"
+    path = temp_dir / f"{layer.name().replace(' ', '_').lower()}_{len(os.listdir(temp_dir))}.gpkg"
     options = QgsVectorFileWriter.SaveVectorOptions()
     options.driverName = "GPKG"
     options.fileEncoding = "UTF-8"
@@ -367,64 +430,97 @@ def _export_layer_to_gpkg(
         layer, str(path), transform_context, options
     )
     if error != QgsVectorFileWriter.NoError:
-        raise GridError("Failed to export AOI layer for clipping.")
+        raise GridError("Failed to export layer for intermediate processing.")
     return path
 
 
-def _grid_slice(
-    station_values: Sequence[Tuple[float, float, float]],
-    dest_path: Path,
+def _create_station_layer(
+    entries: Sequence[Tuple[float, float, float]],
+    log_transform: bool,
     temp_dir: Path,
+    target_crs: QgsCoordinateReferenceSystem,
+    transform_context,
+    date_key: str,
+) -> Tuple[Path, List[Tuple[float, float, float, float]]]:
+    layer = QgsVectorLayer("Point?crs=EPSG:4326", "slice_points", "memory")
+    provider = layer.dataProvider()
+    provider.addAttributes(
+        [
+            QgsField("value", QVariant.Double),
+            QgsField("raw", QVariant.Double),
+        ]
+    )
+    layer.updateFields()
+
+    features: List[QgsFeature] = []
+    transformed_points: List[Tuple[float, float, float, float]] = []
+    transformer = QgsCoordinateTransform(QgsCoordinateReferenceSystem("EPSG:4326"), target_crs, transform_context)
+    for lon, lat, raw_value in entries:
+        point_4326 = QgsPointXY(lon, lat)
+        point_target = transformer.transform(point_4326)
+        transformed = math.log1p(raw_value) if log_transform else raw_value
+
+        feature = QgsFeature(layer.fields())
+        feature.setGeometry(QgsGeometry.fromPointXY(point_4326))
+        feature.setAttributes([transformed, raw_value])
+        features.append(feature)
+
+        transformed_points.append((point_target.x(), point_target.y(), transformed, raw_value))
+
+    provider.addFeatures(features)
+    layer.updateExtents()
+
+    save_path = temp_dir / f"stations_{date_key.replace('-', '')}.gpkg"
+    options = QgsVectorFileWriter.SaveVectorOptions()
+    options.driverName = "GPKG"
+    options.fileEncoding = "UTF-8"
+    options.actionOnExistingFile = QgsVectorFileWriter.CreateOrOverwriteFile
+    options.destCRS = target_crs
+    options.ct = QgsCoordinateTransform(layer.crs(), target_crs, transform_context)
+
+    error, _, _, _ = QgsVectorFileWriter.writeAsVectorFormatV3(
+        layer, str(save_path), transform_context, options
+    )
+    if error != QgsVectorFileWriter.NoError:
+        raise GridError("Failed to export station layer for gridding.")
+    return save_path, transformed_points
+
+
+def _resolve_algorithm(method: str, power: float, radius: float, min_points: int) -> str:
+    radius = max(radius, 0.001)
+    method = (method or "idw").lower()
+    if method == "nearest":
+        return f"nearest:radius1={radius}:radius2={radius}"
+    if method == "average":
+        return f"average:radius1={radius}:radius2={radius}:min_points={max(min_points, 1)}"
+    if method == "linear":
+        return "linear"
+    # Default to IDW
+    return (
+        f"invdist:power={power}:smoothing=0.0:radius1={radius}:radius2={radius}"
+        f":min_points={max(min_points, 1)}"
+    )
+
+
+def _grid_slice(
+    vector_path: Path,
+    dest_path: Path,
     buffered_extent: QgsRectangle,
     target_crs: QgsCoordinateReferenceSystem,
     resolution: float,
     width: int,
     height: int,
     nodata: float,
-    power: float,
-    radius: float,
-    min_points: int,
-    transform_context,
+    params: GridParameters,
+    search_radius: float,
 ) -> None:
-    temp_layer = QgsVectorLayer("Point?crs=EPSG:4326", "slice", "memory")
-    provider = temp_layer.dataProvider()
-    provider.addAttributes(
-        [
-            QgsField("value", QVariant.Double),
-        ]
-    )
-    temp_layer.updateFields()
-
-    features: List[QgsFeature] = []
-    for lon, lat, value in station_values:
-        feature = QgsFeature()
-        feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(lon, lat)))
-        feature.setAttributes([value])
-        features.append(feature)
-
-    provider.addFeatures(features)
-    temp_layer.updateExtents()
-
-    reprojected_path = temp_dir / "slice_points.gpkg"
-    options = QgsVectorFileWriter.SaveVectorOptions()
-    options.driverName = "GPKG"
-    options.fileEncoding = "UTF-8"
-    options.actionOnExistingFile = QgsVectorFileWriter.CreateOrOverwriteFile
-    options.destCRS = target_crs
-    options.ct = QgsCoordinateTransform(temp_layer.crs(), target_crs, transform_context)
-
-    error, _, _, _ = QgsVectorFileWriter.writeAsVectorFormatV3(
-        temp_layer, str(reprojected_path), transform_context, options
-    )
-    if error != QgsVectorFileWriter.NoError:
-        raise GridError("Failed to export temporary point layer for gridding.")
-
     xmin = buffered_extent.xMinimum()
     xmax = buffered_extent.xMaximum()
     ymin = buffered_extent.yMinimum()
     ymax = buffered_extent.yMaximum()
 
-    algorithm = f"invdist:power={power}:smoothing=0.0:radius1={radius}:radius2={radius}:min_points={min_points}"
+    algorithm = _resolve_algorithm(params.method, params.idw_power, search_radius, params.idw_min_points)
+
     creation_options = ["TILED=YES", "COMPRESS=LZW", "BIGTIFF=IF_SAFER"]
     grid_options = gdal.GridOptions(
         format="GTiff",
@@ -437,9 +533,75 @@ def _grid_slice(
         noData=nodata,
         creationOptions=creation_options,
     )
-    ds = gdal.Grid(str(dest_path), str(reprojected_path), options=grid_options)
+
+    ds = gdal.Grid(str(dest_path), str(vector_path), options=grid_options)
     if ds:
         ds = None
+
+
+def _grid_slice_gwr(
+    transformed_points: Sequence[Tuple[float, float, float, float]],
+    dest_path: Path,
+    buffered_extent: QgsRectangle,
+    target_crs: QgsCoordinateReferenceSystem,
+    resolution: float,
+    width: int,
+    height: int,
+    nodata: float,
+    params: GridParameters,
+    search_radius: float,
+) -> None:
+    if not transformed_points:
+        _create_empty_raster(dest_path, buffered_extent, resolution, width, height, target_crs, nodata)
+        return
+
+    xs = np.array([pt[0] for pt in transformed_points], dtype=np.float64)
+    ys = np.array([pt[1] for pt in transformed_points], dtype=np.float64)
+    values = np.array([pt[2] for pt in transformed_points], dtype=np.float64)
+
+    arr = np.full((height, width), nodata, dtype=np.float32)
+    bandwidth = search_radius if search_radius > 0 else resolution * 5.0
+    bandwidth = max(bandwidth, resolution)
+    bw2 = bandwidth * bandwidth
+    min_points = max(params.idw_min_points, 1)
+
+    xmin = buffered_extent.xMinimum()
+    ymax = buffered_extent.yMaximum()
+
+    ones = np.ones(xs.shape[0], dtype=np.float64)
+
+    for row in range(height):
+        y = ymax - (row + 0.5) * resolution
+        dy = ys - y
+        for col in range(width):
+            x = xmin + (col + 0.5) * resolution
+            dx = xs - x
+            dist2 = dx * dx + dy * dy
+            weights = np.exp(-0.5 * dist2 / bw2)
+            mask = weights > 1e-8
+            if np.count_nonzero(mask) < min_points:
+                continue
+
+            W = weights[mask]
+            if W.sum() <= 0:
+                continue
+
+            X = np.vstack((ones[mask], xs[mask], ys[mask])).T
+            Y = values[mask]
+
+            W_sqrt = np.sqrt(W)
+            Xw = X * W_sqrt[:, None]
+            yw = Y * W_sqrt
+
+            try:
+                coeffs, *_ = np.linalg.lstsq(Xw, yw, rcond=None)
+                pred = coeffs[0] + coeffs[1] * x + coeffs[2] * y
+            except np.linalg.LinAlgError:
+                pred = np.average(Y, weights=W)
+
+            arr[row, col] = np.float32(pred)
+
+    _write_array_to_raster(arr, dest_path, buffered_extent, resolution, target_crs, nodata)
 
 
 def _create_empty_raster(
@@ -467,6 +629,36 @@ def _create_empty_raster(
     band = dataset.GetRasterBand(1)
     band.Fill(nodata)
     band.SetNoDataValue(nodata)
+    dataset.FlushCache()
+    dataset = None
+
+
+def _write_array_to_raster(
+    array: np.ndarray,
+    dest_path: Path,
+    extent: QgsRectangle,
+    resolution: float,
+    target_crs: QgsCoordinateReferenceSystem,
+    nodata: float,
+) -> None:
+    height, width = array.shape
+    creation_options = ["TILED=YES", "COMPRESS=LZW", "BIGTIFF=IF_SAFER"]
+    driver = gdal.GetDriverByName("GTiff")
+    dataset = driver.Create(str(dest_path), width, height, 1, gdal.GDT_Float32, options=creation_options)
+    geotransform = (
+        extent.xMinimum(),
+        resolution,
+        0.0,
+        extent.yMaximum(),
+        0.0,
+        -resolution,
+    )
+    dataset.SetGeoTransform(geotransform)
+    dataset.SetProjection(target_crs.toWkt())
+    band = dataset.GetRasterBand(1)
+    band.WriteArray(array)
+    band.SetNoDataValue(nodata)
+    band.FlushCache()
     dataset.FlushCache()
     dataset = None
 
@@ -515,6 +707,66 @@ def _clip_to_polygon(
     os.replace(temp_path, raster_path)
 
 
+def _apply_inverse_transform(raster_path: Path, nodata: float) -> None:
+    dataset = gdal.Open(str(raster_path), gdal.GA_Update)
+    if not dataset:
+        return
+    band = dataset.GetRasterBand(1)
+    array = band.ReadAsArray()
+    mask = array != nodata
+    array[mask] = np.expm1(array[mask])
+    band.WriteArray(array)
+    band.SetNoDataValue(nodata)
+    band.FlushCache()
+    dataset.FlushCache()
+    dataset = None
+
+
+def _burn_station_values(
+    raster_path: Path,
+    vector_path: Path,
+    burn_distance: float,
+    temp_dir: Path,
+    transform_context,
+) -> None:
+    points_layer = QgsVectorLayer(str(vector_path), "stations", "ogr")
+    if not points_layer.isValid():
+        return
+
+    attribute_name = "raw"
+    rasterize_source_path = vector_path
+
+    if burn_distance > 0.0:
+        buffer_layer = QgsVectorLayer(f"Polygon?crs={points_layer.crs().authid()}", "station_buffers", "memory")
+        provider = buffer_layer.dataProvider()
+        provider.addAttributes([QgsField(attribute_name, QVariant.Double)])
+        buffer_layer.updateFields()
+
+        for feature in points_layer.getFeatures():
+            raw_value = feature[attribute_name]
+            geom = feature.geometry()
+            buffer_geom = geom.buffer(burn_distance, 16)
+            if buffer_geom is None or buffer_geom.isEmpty():
+                continue
+            new_feature = QgsFeature(buffer_layer.fields())
+            new_feature.setGeometry(buffer_geom)
+            new_feature.setAttributes([raw_value])
+            provider.addFeature(new_feature)
+
+        buffer_layer.updateExtents()
+        rasterize_source_path = _export_layer_to_gpkg(
+            buffer_layer,
+            points_layer.crs(),
+            temp_dir,
+            transform_context,
+        )
+
+    rasterize_options = gdal.RasterizeOptions(attribute=attribute_name, allTouched=True)
+    ds = gdal.Rasterize(str(raster_path), str(rasterize_source_path), options=rasterize_options)
+    if ds:
+        ds = None
+
+
 def _translate_to_cog(src_path: Path, dst_path: Path) -> None:
     translate_options = gdal.TranslateOptions(format="COG")
     ds = gdal.Translate(str(dst_path), str(src_path), options=translate_options)
@@ -522,10 +774,44 @@ def _translate_to_cog(src_path: Path, dst_path: Path) -> None:
         ds = None
 
 
-def _build_vrt(tif_paths: Sequence[Path], vrt_path: Path) -> None:
-    ds = gdal.BuildVRT(str(vrt_path), [str(path) for path in tif_paths])
+def _build_vrt(tif_paths: Sequence[Path], vrt_path: Path, band_labels: Sequence[str]) -> None:
+    options = gdal.BuildVRTOptions(separate=True)
+    ds = gdal.BuildVRT(str(vrt_path), [str(path) for path in tif_paths], options=options)
     if ds:
         ds = None
+
+    try:
+        import xml.etree.ElementTree as ET
+
+        tree = ET.parse(vrt_path)
+    except ET.ParseError:
+        return
+
+    root = tree.getroot()
+    bands = root.findall("VRTRasterBand")
+
+    for band_elem, label in zip(bands, band_labels):
+        band_elem.set("name", label)
+        desc_elem = band_elem.find("Description")
+        if desc_elem is None:
+            desc_elem = ET.SubElement(band_elem, "Description")
+        desc_elem.text = label
+
+        metadata_elem = band_elem.find("Metadata")
+        if metadata_elem is None:
+            metadata_elem = ET.SubElement(band_elem, "Metadata")
+
+        timestamp_found = False
+        for item in metadata_elem.findall("MDI"):
+            if item.get("key") == "TIMESTAMP":
+                item.text = label
+                timestamp_found = True
+                break
+        if not timestamp_found:
+            item = ET.SubElement(metadata_elem, "MDI", key="TIMESTAMP")
+            item.text = label
+
+    tree.write(vrt_path, encoding="utf-8", xml_declaration=True)
 
 
 def _write_coverage_csv(

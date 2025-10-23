@@ -1,0 +1,14 @@
+﻿@@
+-        self._append_grid_log(
+-            tr("Generated {count} raster slice(s) for {variable}.").format(
+-                count=len(outputs.tif_paths),
+-                variable=outputs.variable_label,
+-            )
+-        )
++        self._append_grid_log(
++            tr("Generated {count} raster slice(s) for {variable} using {method}.").format(
++                count=len(outputs.tif_paths),
++                variable=outputs.variable_label,
++                method=self._grid_method_combo.currentText(),
++            )
++        )

@@ -1,0 +1,78 @@
+﻿*** Begin Patch
+*** Add File Section: gridder.py:_grid_slice_gwr
+@@
+ def _grid_slice(
+     vector_path: Path,
+     dest_path: Path,
+     buffered_extent: QgsRectangle,
+     target_crs: QgsCoordinateReferenceSystem,
+@@
+     if ds:
+         ds = None
+ 
++
++def _grid_slice_gwr(
++    transformed_points: Sequence[Tuple[float, float, float, float]],
++    dest_path: Path,
++    buffered_extent: QgsRectangle,
++    target_crs: QgsCoordinateReferenceSystem,
++    resolution: float,
++    width: int,
++    height: int,
++    nodata: float,
++    params: GridParameters,
++    search_radius: float,
++) -> None:
++    if not transformed_points:
++        _create_empty_raster(dest_path, buffered_extent, resolution, width, height, target_crs, nodata)
++        return
++
++    xs = np.array([pt[0] for pt in transformed_points], dtype=np.float64)
++    ys = np.array([pt[1] for pt in transformed_points], dtype=np.float64)
++    values = np.array([pt[2] for pt in transformed_points], dtype=np.float64)
++
++    arr = np.full((height, width), nodata, dtype=np.float32)
++    bandwidth = search_radius if search_radius > 0 else resolution * 5.0
++    bandwidth = max(bandwidth, resolution)
++    bw2 = bandwidth * bandwidth
++    min_points = max(params.idw_min_points, 1)
++
++    xmin = buffered_extent.xMinimum()
++    ymax = buffered_extent.yMaximum()
++
++    ones = np.ones(xs.shape[0], dtype=np.float64)
++
++    for row in range(height):
++        y = ymax - (row + 0.5) * resolution
++        dy = ys - y
++        for col in range(width):
++            x = xmin + (col + 0.5) * resolution
++            dx = xs - x
++            dist2 = dx * dx + dy * dy
++            weights = np.exp(-0.5 * dist2 / bw2)
++            mask = weights > 1e-8
++            if np.count_nonzero(mask) < min_points:
++                continue
++
++            W = weights[mask]
++            if W.sum() <= 0:
++                continue
++
++            X = np.vstack((ones[mask], xs[mask], ys[mask])).T
++            Y = values[mask]
++
++            W_sqrt = np.sqrt(W)
++            Xw = X * W_sqrt[:, None]
++            yw = Y * W_sqrt
++
++            try:
++                coeffs, *_ = np.linalg.lstsq(Xw, yw, rcond=None)
++                pred = coeffs[0] + coeffs[1] * x + coeffs[2] * y
++            except np.linalg.LinAlgError:
++                pred = np.average(Y, weights=W)
++
++            arr[row, col] = np.float32(pred)
++
++    _write_array_to_raster(arr, dest_path, buffered_extent, resolution, target_crs, nodata)
++
+*** End Patch

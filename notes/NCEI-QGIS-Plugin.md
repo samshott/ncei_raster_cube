@@ -21,6 +21,7 @@ Goal: QGIS plugin that generates time-enabled raster cubes from **NCEI** data (s
 - ADS field picker exposes plain-language variable names and filters cached CSVs to selected columns.
 - ADS preview now reports summary stats, generates quick plots, and supports custom CSV export paths.
 - ADS UI enforces sane date bounds, persists user preferences, and updates labels to match selected units.
+- Station gridding supports multiple methods (IDW, nearest neighbor, linear/TIN, moving average) with optional log transform and station burn-in controls.
 - ADS requests chunk station lists >100 IDs and publishes a point layer of fetched stations in QGIS.
 <!-- CAPABILITIES:END -->
 
@@ -29,6 +30,8 @@ Goal: QGIS plugin that generates time-enabled raster cubes from **NCEI** data (s
 - [x] Implement settings panel for CDO token (store in QSettings and validate).
 - [x] Implement ADS `daily-summaries` bbox fetch (CSV -> preview table).
 - [ ] Implement CDO `GHCND` fetch with chunked dates and pagination.
+- [ ] Interactive Plots 
+- [ ] Aggregate to months/seasons/years option
 - [ ] Grid station data (IDW) to target raster; write CF-NetCDF.
 - [ ] Load cube into QGIS and enable temporal controls.
 <!-- NEXT_STEPS:END -->
@@ -48,6 +51,7 @@ Goal: QGIS plugin that generates time-enabled raster cubes from **NCEI** data (s
 <!-- LOG:BEGIN -->
 - 2025-10-22 (PDT): Added pre-flight validation, compact tabbed layout, unit-aware labels, and persisted UI preferences.
 - 2025-10-22 (PDT): Added ADS station chunking plus station layer injection for spatial QA.
+- 2025-10-22 (PDT): Introduced multi-method gridding (IDW/nearest/linear/moving average) with precip-friendly log transform and station burn-in options.
 - 2025-10-22 (PDT): Added ADS summary stats, plotting, trim-to-selection CSV export with persistent save path.
 - 2025-10-22 (PDT): Added friendly-name field picker, column filtering, and station-count tooltips for ADS preview.
 - 2025-10-22 (PDT): Integrated CDO station discovery into ADS fetch, added map extent helper, and improved status feedback.

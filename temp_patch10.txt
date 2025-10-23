@@ -1,0 +1,47 @@
+﻿*** Begin Patch
+*** Add File Section: gridder.py:_write_array_to_raster
+@@
+ def _grid_slice(
+     vector_path: Path,
+     dest_path: Path,
+     buffered_extent: QgsRectangle,
+@@
+     if ds:
+         ds = None
+ 
+ 
+ def _create_empty_raster(
+@@
+     dataset.FlushCache()
+     dataset = None
++
++
++def _write_array_to_raster(
++    array: np.ndarray,
++    dest_path: Path,
++    extent: QgsRectangle,
++    resolution: float,
++    target_crs: QgsCoordinateReferenceSystem,
++    nodata: float,
++) -> None:
++    height, width = array.shape
++    creation_options = ["TILED=YES", "COMPRESS=LZW", "BIGTIFF=IF_SAFER"]
++    driver = gdal.GetDriverByName("GTiff")
++    dataset = driver.Create(str(dest_path), width, height, 1, gdal.GDT_Float32, options=creation_options)
++    geotransform = (
++        extent.xMinimum(),
++        resolution,
++        0.0,
++        extent.yMaximum(),
++        0.0,
++        -resolution,
++    )
++    dataset.SetGeoTransform(geotransform)
++    dataset.SetProjection(target_crs.toWkt())
++    band = dataset.GetRasterBand(1)
++    band.WriteArray(array)
++    band.SetNoDataValue(nodata)
++    band.FlushCache()
++    dataset.FlushCache()
++    dataset = None
+*** End Patch

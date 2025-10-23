@@ -1,0 +1,13 @@
+﻿@@
+     def _update_radius_controls(self) -> None:
+-        auto = self._grid_auto_radius_check.isChecked()
+-        self._grid_auto_radius_multiplier_spin.setEnabled(auto)
+-        self._grid_radius_spin.setEnabled(not auto)
++        method = self._grid_method_combo.currentData() or "idw"
++        needs_radius = method in {"idw", "nearest", "average"}
++        auto = self._grid_auto_radius_check.isChecked()
++        self._grid_auto_radius_multiplier_spin.setEnabled(needs_radius and auto and self._grid_auto_radius_check.isEnabled())
++        self._grid_radius_spin.setEnabled(needs_radius and not auto)
++        if not needs_radius:
++            self._grid_auto_radius_multiplier_spin.setValue(self._grid_auto_radius_multiplier_spin.value())
++            self._grid_radius_spin.setValue(self._grid_radius_spin.value())

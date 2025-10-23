@@ -168,6 +168,7 @@ class ADSFetchDialog(QDialog):
         self._settings = QSettings()
         self._last_result: ADSFetchResult | None = None
         self._loading_preferences = True
+        self._has_loaded_grid_preferences = False
         self._stored_selected_codes: List[str] | None = None
         self._base_type_catalog: Dict[str, str] = {}
         self._station_layer_id: str | None = None
@@ -179,7 +180,6 @@ class ADSFetchDialog(QDialog):
         # Populate data types and finalize initialization.
         self._on_dataset_changed(self._dataset_combo.currentText())
         self._loading_preferences = False
-        self._persist_preferences()
         self._clear_plot()
         self._reset_results()
 
@@ -275,9 +275,16 @@ class ADSFetchDialog(QDialog):
         self._grid_variable_combo = QComboBox()
         self._grid_variable_combo.setEnabled(False)
 
+        self._grid_method_combo = QComboBox()
+        self._grid_method_combo.addItem(tr("Inverse Distance (IDW)"), "idw")
+        self._grid_method_combo.addItem(tr("Nearest Neighbor"), "nearest")
+        self._grid_method_combo.addItem(tr("Linear (TIN)"), "linear")
+        self._grid_method_combo.addItem(tr("Moving Average"), "average")
+        self._grid_method_combo.addItem(tr("Geographically Weighted Regression (GWR)"), "gwr")
+
         self._grid_output_line = QLineEdit()
         self._grid_output_line.setPlaceholderText(tr("Choose output directory..."))
-        self._grid_output_browse = QPushButton(tr("Browse…"))
+        self._grid_output_browse = QPushButton(tr("Browse..."))
 
         self._grid_crs_widget = QgsProjectionSelectionWidget()
         self._grid_crs_widget.setCrs(QgsCoordinateReferenceSystem("EPSG:3857"))
@@ -304,14 +311,14 @@ class ADSFetchDialog(QDialog):
 
         self._grid_min_points_spin = QSpinBox()
         self._grid_min_points_spin.setRange(1, 50)
-        self._grid_min_points_spin.setValue(3)
+        self._grid_min_points_spin.setValue(1)
 
-        self._grid_auto_radius_check = QCheckBox(tr("Auto search radius (× cell size)"))
+        self._grid_auto_radius_check = QCheckBox(tr("Auto search radius (x cell size)"))
         self._grid_auto_radius_check.setChecked(True)
         self._grid_auto_radius_multiplier_spin = QDoubleSpinBox()
-        self._grid_auto_radius_multiplier_spin.setRange(1.0, 10.0)
+        self._grid_auto_radius_multiplier_spin.setRange(0.1, 250.0)
         self._grid_auto_radius_multiplier_spin.setSingleStep(0.5)
-        self._grid_auto_radius_multiplier_spin.setValue(3.0)
+        self._grid_auto_radius_multiplier_spin.setValue(5.0)
 
         self._grid_radius_spin = QDoubleSpinBox()
         self._grid_radius_spin.setRange(1.0, 1000000.0)
@@ -322,6 +329,15 @@ class ADSFetchDialog(QDialog):
         self._grid_skip_sparse_check = QCheckBox(tr("Skip slices with < min stations"))
         self._grid_skip_sparse_check.setChecked(True)
         self._grid_derive_tavg_check = QCheckBox(tr("Derive TAVG from TMIN/TMAX when missing"))
+        self._grid_log_check = QCheckBox(tr("Apply log1p/expm1 transform"))
+        self._grid_log_check.setChecked(False)
+        self._grid_burn_check = QCheckBox(tr("Burn station values into interpolated raster"))
+        self._grid_burn_check.setChecked(True)
+        self._grid_burn_radius_spin = QDoubleSpinBox()
+        self._grid_burn_radius_spin.setRange(0.0, 10.0)
+        self._grid_burn_radius_spin.setDecimals(2)
+        self._grid_burn_radius_spin.setSingleStep(0.1)
+        self._grid_burn_radius_spin.setValue(0.6)
         self._grid_clip_check = QCheckBox(tr("Clip outputs to AOI polygon"))
         self._grid_clip_check.setChecked(True)
         self._grid_cog_check = QCheckBox(tr("Create Cloud Optimized GeoTIFF (COG) copies"))
@@ -380,8 +396,11 @@ class ADSFetchDialog(QDialog):
         main_layout.addWidget(splitter, stretch=1)
         main_layout.addWidget(self._status_label)
 
+        self._update_method_controls()
+        self._update_burn_controls()
         self._update_grid_extent_controls()
         self._update_radius_controls()
+        self._populate_from_map_extent(initial=True)
         self._update_grid_run_state()
 
     def _connect_signals(self) -> None:
@@ -403,7 +422,9 @@ class ADSFetchDialog(QDialog):
         self._grid_extent_combo.currentIndexChanged.connect(self._update_grid_extent_controls)
         self._grid_output_browse.clicked.connect(self._browse_output_folder)
         self._grid_auto_radius_check.toggled.connect(self._update_radius_controls)
-        self._grid_variable_combo.currentIndexChanged.connect(self._update_grid_run_state)
+        self._grid_variable_combo.currentIndexChanged.connect(self._on_grid_variable_changed)
+        self._grid_method_combo.currentIndexChanged.connect(self._on_grid_method_changed)
+        self._grid_burn_check.toggled.connect(self._update_burn_controls)
         self._grid_output_line.textChanged.connect(lambda _: self._update_grid_run_state())
         self._grid_run_button.clicked.connect(self._on_run_grid)
 
@@ -498,6 +519,7 @@ class ADSFetchDialog(QDialog):
 
         form = QFormLayout()
         form.addRow(tr("Variable"), self._grid_variable_combo)
+        form.addRow(tr("Method"), self._grid_method_combo)
 
         output_widget = QWidget()
         output_layout = QHBoxLayout(output_widget)
@@ -530,10 +552,13 @@ class ADSFetchDialog(QDialog):
         radius_layout.addWidget(QLabel(tr("Manual radius")))
         radius_layout.addWidget(self._grid_radius_spin)
         form.addRow(tr("Search radius"), radius_widget)
+        form.addRow(tr("Burn radius (cells)"), self._grid_burn_radius_spin)
 
         layout.addLayout(form)
         layout.addWidget(self._grid_skip_sparse_check)
         layout.addWidget(self._grid_derive_tavg_check)
+        layout.addWidget(self._grid_log_check)
+        layout.addWidget(self._grid_burn_check)
         layout.addWidget(self._grid_clip_check)
         layout.addWidget(self._grid_cog_check)
         layout.addWidget(self._grid_qa_check)
@@ -556,9 +581,26 @@ class ADSFetchDialog(QDialog):
         self._grid_clip_check.setEnabled(use_layer)
 
     def _update_radius_controls(self) -> None:
+        method = self._grid_method_combo.currentData() or "idw"
+        needs_radius = method in {"idw", "nearest", "average", "gwr"}
         auto = self._grid_auto_radius_check.isChecked()
-        self._grid_auto_radius_multiplier_spin.setEnabled(auto)
-        self._grid_radius_spin.setEnabled(not auto)
+        self._grid_auto_radius_multiplier_spin.setEnabled(needs_radius and auto and self._grid_auto_radius_check.isEnabled())
+        self._grid_radius_spin.setEnabled(needs_radius and not auto)
+
+    def _update_method_controls(self) -> None:
+        method = self._grid_method_combo.currentData() or "idw"
+        needs_radius = method in {"idw", "nearest", "average", "gwr"}
+        allow_power = method == "idw"
+        allow_min_points = method in {"idw", "average", "gwr"}
+
+        self._grid_power_spin.setEnabled(allow_power)
+        self._grid_min_points_spin.setEnabled(allow_min_points)
+        self._grid_auto_radius_check.setEnabled(needs_radius)
+        self._update_radius_controls()
+
+    def _update_burn_controls(self) -> None:
+        enabled = self._grid_burn_check.isChecked()
+        self._grid_burn_radius_spin.setEnabled(enabled)
 
     def _browse_output_folder(self) -> None:
         start_dir = self._grid_output_line.text().strip() or str(Path.home())
@@ -582,6 +624,10 @@ class ADSFetchDialog(QDialog):
             self._grid_variable_combo.addItem(tr("No variables available"), "")
             self._grid_variable_combo.setEnabled(False)
         self._grid_variable_combo.blockSignals(False)
+        if available and not self._has_loaded_grid_preferences:
+            current_code = self._grid_variable_combo.currentData()
+            if current_code:
+                self._apply_variable_defaults(current_code)
         self._update_grid_run_state()
 
     def _update_grid_run_state(self) -> None:
@@ -589,6 +635,38 @@ class ADSFetchDialog(QDialog):
         variable_selected = bool(self._grid_variable_combo.currentData())
         output_dir = bool(self._grid_output_line.text().strip())
         self._grid_run_button.setEnabled(has_result and variable_selected and output_dir)
+
+    def _on_grid_variable_changed(self) -> None:
+        self._update_grid_run_state()
+        if self._loading_preferences or self._has_loaded_grid_preferences:
+            return
+        variable_code = self._grid_variable_combo.currentData()
+        if variable_code:
+            self._apply_variable_defaults(variable_code)
+
+    def _on_grid_method_changed(self) -> None:
+        self._update_method_controls()
+        self._update_grid_run_state()
+
+    def _apply_variable_defaults(self, variable_code: str) -> None:
+        code = (variable_code or "").upper()
+        if code in {"PRCP", "SNOW", "SNWD"}:
+            idx = self._grid_method_combo.findData("idw")
+            if idx != -1:
+                self._grid_method_combo.setCurrentIndex(idx)
+            self._grid_log_check.setChecked(True)
+            self._grid_burn_check.setChecked(True)
+        elif code in {"TMAX", "TMIN", "TAVG"}:
+            idx = self._grid_method_combo.findData("linear")
+            if idx != -1:
+                self._grid_method_combo.setCurrentIndex(idx)
+            self._grid_log_check.setChecked(False)
+            self._grid_burn_check.setChecked(False)
+        else:
+            self._grid_log_check.setChecked(False)
+            self._grid_burn_check.setChecked(False)
+        self._update_method_controls()
+        self._update_burn_controls()
 
     def _determine_grid_extent(
         self,
@@ -651,6 +729,7 @@ class ADSFetchDialog(QDialog):
             extent_rect=extent_rect,
             clip_layer=clip_layer,
             clip_enabled=self._grid_clip_check.isChecked() and clip_layer is not None,
+            method=self._grid_method_combo.currentData(),
             auto_radius=self._grid_auto_radius_check.isChecked(),
             radius=self._grid_radius_spin.value(),
             auto_radius_multiplier=self._grid_auto_radius_multiplier_spin.value(),
@@ -658,6 +737,9 @@ class ADSFetchDialog(QDialog):
             idw_min_points=self._grid_min_points_spin.value(),
             skip_sparse_slices=self._grid_skip_sparse_check.isChecked(),
             derive_average_temperature=self._grid_derive_tavg_check.isChecked(),
+            log_transform=self._grid_log_check.isChecked(),
+            burn_stations=self._grid_burn_check.isChecked(),
+            burn_radius_cells=self._grid_burn_radius_spin.value(),
             output_dir=output_dir,
             write_vrt=True,
             write_cog=self._grid_cog_check.isChecked(),
@@ -691,9 +773,10 @@ class ADSFetchDialog(QDialog):
             return
 
         self._append_grid_log(
-            tr("Generated {count} raster slice(s) for {variable}.").format(
+            tr("Generated {count} raster slice(s) for {variable} using {method}.").format(
                 count=len(outputs.tif_paths),
                 variable=outputs.variable_label,
+                method=self._grid_method_combo.currentText(),
             )
         )
         if outputs.coverage_csv:
@@ -708,8 +791,13 @@ class ADSFetchDialog(QDialog):
             raster_layer = QgsRasterLayer(str(outputs.vrt_path), layer_name)
             if raster_layer.isValid():
                 QgsProject.instance().addMapLayer(raster_layer)
+                for index, label in enumerate(outputs.band_labels, start=1):
+                    try:
+                        raster_layer.setBandName(index, label)
+                    except AttributeError:
+                        pass
                 self._append_grid_log(
-                    tr("Added VRT to map. Configure temporal settings via Layer Properties ▸ Temporal.")
+                    tr("Added VRT to map. Configure temporal settings via Layer Properties ? Temporal.")
                 )
             else:
                 self._append_grid_log(tr("Warning: VRT layer invalid; not added to map."))
@@ -757,6 +845,29 @@ class ADSFetchDialog(QDialog):
         self._start_date.blockSignals(False)
         self._end_date.blockSignals(False)
 
+        method_pref_key = f"{root}/method"
+        self._has_loaded_grid_preferences = self._settings.contains(method_pref_key)
+
+        method_value = self._settings.value(method_pref_key, "idw", str)
+        idx = self._grid_method_combo.findData(method_value)
+        if idx != -1:
+            self._grid_method_combo.setCurrentIndex(idx)
+
+        self._grid_auto_radius_check.setChecked(self._settings.value(f"{root}/auto_radius", True, bool))
+        self._grid_radius_spin.setValue(float(self._settings.value(f"{root}/radius", self._grid_radius_spin.value())))
+        self._grid_auto_radius_multiplier_spin.setValue(float(self._settings.value(f"{root}/auto_radius_multiplier", self._grid_auto_radius_multiplier_spin.value())))
+        self._grid_power_spin.setValue(float(self._settings.value(f"{root}/idw_power", self._grid_power_spin.value())))
+        self._grid_min_points_spin.setValue(int(self._settings.value(f"{root}/min_points", self._grid_min_points_spin.value())))
+        self._grid_skip_sparse_check.setChecked(self._settings.value(f"{root}/skip_sparse", self._grid_skip_sparse_check.isChecked(), bool))
+        self._grid_derive_tavg_check.setChecked(self._settings.value(f"{root}/derive_tavg", self._grid_derive_tavg_check.isChecked(), bool))
+        self._grid_log_check.setChecked(self._settings.value(f"{root}/log_transform", False, bool))
+        self._grid_burn_check.setChecked(self._settings.value(f"{root}/burn_stations", True, bool))
+        self._grid_burn_radius_spin.setValue(float(self._settings.value(f"{root}/burn_radius", self._grid_burn_radius_spin.value())))
+        self._grid_clip_check.setChecked(self._settings.value(f"{root}/clip_outputs", True, bool))
+        self._grid_cog_check.setChecked(self._settings.value(f"{root}/write_cog", self._grid_cog_check.isChecked(), bool))
+        self._grid_qa_check.setChecked(self._settings.value(f"{root}/write_qa", self._grid_qa_check.isChecked(), bool))
+        self._grid_add_to_map_check.setChecked(self._settings.value(f"{root}/add_to_map", self._grid_add_to_map_check.isChecked(), bool))
+
         selected_codes_key = f"{root}/selected_codes"
         if self._settings.contains(selected_codes_key):
             saved = self._settings.value(selected_codes_key, "", str)
@@ -770,6 +881,9 @@ class ADSFetchDialog(QDialog):
                 self._stored_selected_codes = []
         else:
             self._stored_selected_codes = None  # Use defaults on first run.
+
+        self._update_method_controls()
+        self._update_burn_controls()
 
     def _persist_preferences(self) -> None:
         """Persist the current UI preferences."""
@@ -788,9 +902,25 @@ class ADSFetchDialog(QDialog):
             f"{root}/end_date",
             self._end_date.date().toString(Qt.ISODate),
         )
+        self._settings.setValue(f"{root}/method", self._grid_method_combo.currentData())
+        self._settings.setValue(f"{root}/auto_radius", self._grid_auto_radius_check.isChecked())
+        self._settings.setValue(f"{root}/radius", self._grid_radius_spin.value())
+        self._settings.setValue(f"{root}/auto_radius_multiplier", self._grid_auto_radius_multiplier_spin.value())
+        self._settings.setValue(f"{root}/idw_power", self._grid_power_spin.value())
+        self._settings.setValue(f"{root}/min_points", self._grid_min_points_spin.value())
+        self._settings.setValue(f"{root}/skip_sparse", self._grid_skip_sparse_check.isChecked())
+        self._settings.setValue(f"{root}/derive_tavg", self._grid_derive_tavg_check.isChecked())
+        self._settings.setValue(f"{root}/log_transform", self._grid_log_check.isChecked())
+        self._settings.setValue(f"{root}/burn_stations", self._grid_burn_check.isChecked())
+        self._settings.setValue(f"{root}/burn_radius", self._grid_burn_radius_spin.value())
+        self._settings.setValue(f"{root}/clip_outputs", self._grid_clip_check.isChecked())
+        self._settings.setValue(f"{root}/write_cog", self._grid_cog_check.isChecked())
+        self._settings.setValue(f"{root}/write_qa", self._grid_qa_check.isChecked())
+        self._settings.setValue(f"{root}/add_to_map", self._grid_add_to_map_check.isChecked())
         selected_codes = ",".join(self._selected_data_types())
         self._settings.setValue(f"{root}/selected_codes", selected_codes)
         self._stored_selected_codes = self._selected_data_types()
+        self._has_loaded_grid_preferences = True
 
     # ------------------------------------------------------------------ Signals --
     def _on_dataset_changed(self, value: str) -> None:
@@ -1433,3 +1563,4 @@ def _default_export_name(dataset: str, start: str, end: str) -> str:
     if start_token and end_token:
         return f"{dataset}_{start_token}-{end_token}.csv"
     return f"{dataset}_ads_export.csv"
+

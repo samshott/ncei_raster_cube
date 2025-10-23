@@ -1,0 +1,53 @@
+﻿*** Begin Patch
+*** Update File: gridder.py
+@@
+-            vector_path = _create_station_layer(
++            vector_path, transformed_points = _create_station_layer(
+                 raw_entries,
+                 params.log_transform,
+                 tmp_dir,
+                 target_crs,
+                 transform_context,
+                 date_key,
+             )
+-
+-            _grid_slice(
+-                vector_path,
+-                dest_path,
+-                buffered_extent,
+-                target_crs,
+-                resolution,
+-                grid_width,
+-                grid_height,
+-                nodata,
+-                params,
+-                search_radius,
+-            )
++
++            if params.method == "gwr":
++                _grid_slice_gwr(
++                    transformed_points,
++                    dest_path,
++                    buffered_extent,
++                    target_crs,
++                    resolution,
++                    grid_width,
++                    grid_height,
++                    nodata,
++                    params,
++                    search_radius,
++                )
++            else:
++                _grid_slice(
++                    vector_path,
++                    dest_path,
++                    buffered_extent,
++                    target_crs,
++                    resolution,
++                    grid_width,
++                    grid_height,
++                    nodata,
++                    params,
++                    search_radius,
++                )
+*** End Patch

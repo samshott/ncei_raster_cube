@@ -1,0 +1,8 @@
+﻿@@
+ - ADS UI enforces sane date bounds, persists user preferences, and updates labels to match selected units.
++- Station gridding supports multiple methods (IDW, nearest neighbor, linear/TIN, moving average) with optional log transform and station burn-in controls.
+ - ADS requests chunk station lists >100 IDs and publishes a point layer of fetched stations in QGIS.
+@@
+ - 2025-10-22 (PDT): Added ADS station chunking plus station layer injection for spatial QA.
++- 2025-10-22 (PDT): Introduced multi-method gridding (IDW/nearest/linear/moving average) with precip-friendly log transform and station burn-in options.
+ - 2025-10-22 (PDT): Added ADS summary stats, plotting, trim-to-selection CSV export with persistent save path.

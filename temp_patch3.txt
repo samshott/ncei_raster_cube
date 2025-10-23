@@ -1,0 +1,7 @@
+﻿@@
+-        self._update_grid_extent_controls()
+-        self._update_radius_controls()
++        self._update_method_controls()
++        self._update_burn_controls()
++        self._update_grid_extent_controls()
++        self._update_radius_controls()

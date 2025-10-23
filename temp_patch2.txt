@@ -1,0 +1,38 @@
+﻿@@
+     def _update_grid_run_state(self) -> None:
+         has_result = self._last_result is not None
+         variable_selected = bool(self._grid_variable_combo.currentData())
+         output_dir = bool(self._grid_output_line.text().strip())
+         self._grid_run_button.setEnabled(has_result and variable_selected and output_dir)
++
++    def _on_grid_variable_changed(self) -> None:
++        self._update_grid_run_state()
++        if self._loading_preferences or self._has_loaded_grid_preferences:
++            return
++        variable_code = self._grid_variable_combo.currentData()
++        if variable_code:
++            self._apply_variable_defaults(variable_code)
++
++    def _on_grid_method_changed(self) -> None:
++        self._update_method_controls()
++        self._update_grid_run_state()
++
++    def _apply_variable_defaults(self, variable_code: str) -> None:
++        code = (variable_code or "").upper()
++        if code in {"PRCP", "SNOW", "SNWD"}:
++            idx = self._grid_method_combo.findData("idw")
++            if idx != -1:
++                self._grid_method_combo.setCurrentIndex(idx)
++            self._grid_log_check.setChecked(True)
++            self._grid_burn_check.setChecked(True)
++        elif code in {"TMAX", "TMIN", "TAVG"}:
++            idx = self._grid_method_combo.findData("linear")
++            if idx != -1:
++                self._grid_method_combo.setCurrentIndex(idx)
++            self._grid_log_check.setChecked(False)
++            self._grid_burn_check.setChecked(False)
++        else:
++            self._grid_log_check.setChecked(False)
++            self._grid_burn_check.setChecked(False)
++        self._update_method_controls()
++        self._update_burn_controls()

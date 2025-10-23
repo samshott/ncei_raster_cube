@@ -1,0 +1,52 @@
+﻿@@
+-def _create_station_layer(
+-    entries: Sequence[Tuple[float, float, float]],
+-    log_transform: bool,
+-    temp_dir: Path,
+-    target_crs: QgsCoordinateReferenceSystem,
+-    transform_context,
+-    date_key: str,
+-) -> Path:
++def _create_station_layer(
++    entries: Sequence[Tuple[float, float, float]],
++    log_transform: bool,
++    temp_dir: Path,
++    target_crs: QgsCoordinateReferenceSystem,
++    transform_context,
++    date_key: str,
++) -> Tuple[Path, List[Tuple[float, float, float, float]]]:
+@@
+-    features: List[QgsFeature] = []
+-    for lon, lat, raw_value in entries:
+-        feature = QgsFeature(layer.fields())
+-        feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(lon, lat)))
+-        transformed = math.log1p(raw_value) if log_transform else raw_value
+-        feature.setAttributes([transformed, raw_value])
+-        features.append(feature)
++    features: List[QgsFeature] = []
++    transformed_points: List[Tuple[float, float, float, float]] = []
++    transformer = QgsCoordinateTransform(QgsCoordinateReferenceSystem("EPSG:4326"), target_crs, transform_context)
++    for lon, lat, raw_value in entries:
++        point_4326 = QgsPointXY(lon, lat)
++        point_target = transformer.transform(point_4326)
++        transformed = math.log1p(raw_value) if log_transform else raw_value
++
++        feature = QgsFeature(layer.fields())
++        feature.setGeometry(QgsGeometry.fromPointXY(point_4326))
++        feature.setAttributes([transformed, raw_value])
++        features.append(feature)
++
++        transformed_points.append((point_target.x(), point_target.y(), transformed, raw_value))
+@@
+-    save_path = temp_dir / f"stations_{date_key.replace('-', '')}.gpkg"
++    save_path = temp_dir / f"stations_{date_key.replace('-', '')}.gpkg"
+@@
+-    options.actionOnExistingFile = QgsVectorFileWriter.CreateOrOverwriteLayer
++    options.actionOnExistingFile = QgsVectorFileWriter.CreateOrOverwriteFile
+@@
+-    if error != QgsVectorFileWriter.NoError:
+-        raise GridError("Failed to export station layer for gridding.")
+-    return save_path
++    if error != QgsVectorFileWriter.NoError:
++        raise GridError("Failed to export station layer for gridding.")
++    return save_path, transformed_points
