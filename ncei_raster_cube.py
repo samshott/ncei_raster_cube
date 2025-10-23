@@ -10,6 +10,7 @@ from qgis.PyQt.QtCore import QCoreApplication
 from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtWidgets import QAction
 
+from .ads_dialog import ADSFetchDialog
 from .settings import TokenSettingsDialog
 
 
@@ -21,6 +22,7 @@ class NCEIRasterCubePlugin:
         self.iface = iface
         self._action: QAction | None = None
         self._settings_action: QAction | None = None
+        self._active_dialog: ADSFetchDialog | None = None
         self._plugin_dir = Path(__file__).resolve().parent
 
     # --- QGIS lifecycle hooks -------------------------------------------------
@@ -62,7 +64,22 @@ class NCEIRasterCubePlugin:
     # --- Plugin functionality -------------------------------------------------
     def run(self) -> None:
         """Entry point when the plugin action is triggered."""
-        self.open_settings_dialog()
+        self.open_ads_dialog()
+
+    def open_ads_dialog(self) -> None:
+        """Launch the ADS fetch dialog."""
+        if self._active_dialog:
+            self._active_dialog.raise_()
+            self._active_dialog.activateWindow()
+            return
+
+        self._active_dialog = ADSFetchDialog(self.iface, self.iface.mainWindow())
+
+        def _cleanup() -> None:
+            self._active_dialog = None
+
+        self._active_dialog.finished.connect(_cleanup)
+        self._active_dialog.show()
 
     def open_settings_dialog(self) -> None:
         """Display the settings dialog to manage API credentials."""

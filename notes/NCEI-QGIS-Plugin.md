@@ -16,12 +16,17 @@ Goal: QGIS plugin that generates time-enabled raster cubes from **NCEI** data (s
 <!-- CAPABILITIES:BEGIN -->
 - Plugin skeleton registered in QGIS with toolbar/menu action and placeholder dialog.
 - Settings dialog persists CDO token in QSettings and validates against CDO `/datasets`.
+- ADS `daily-summaries` bbox fetch dialog downloads CSV, caches raw output, and previews records.
+- ADS fetch auto-discovers stations via CDO and can seed bbox from current map extent.
+- ADS field picker exposes plain-language variable names and filters cached CSVs to selected columns.
+- ADS preview now reports summary stats, generates quick plots, and supports custom CSV export paths.
+- ADS UI enforces sane date bounds, persists user preferences, and updates labels to match selected units.
 <!-- CAPABILITIES:END -->
 
 ## Next Steps
 <!-- NEXT_STEPS:BEGIN -->
 - [x] Implement settings panel for CDO token (store in QSettings and validate).
-- [ ] Implement ADS `daily-summaries` bbox fetch (CSV -> preview table).
+- [x] Implement ADS `daily-summaries` bbox fetch (CSV -> preview table).
 - [ ] Implement CDO `GHCND` fetch with chunked dates and pagination.
 - [ ] Grid station data (IDW) to target raster; write CF-NetCDF.
 - [ ] Load cube into QGIS and enable temporal controls.
@@ -40,6 +45,11 @@ Goal: QGIS plugin that generates time-enabled raster cubes from **NCEI** data (s
 
 ## Progress Log
 <!-- LOG:BEGIN -->
+- 2025-10-22 (PDT): Added pre-flight validation, compact tabbed layout, unit-aware labels, and persisted UI preferences.
+- 2025-10-22 (PDT): Added ADS summary stats, plotting, trim-to-selection CSV export with persistent save path.
+- 2025-10-22 (PDT): Added friendly-name field picker, column filtering, and station-count tooltips for ADS preview.
+- 2025-10-22 (PDT): Integrated CDO station discovery into ADS fetch, added map extent helper, and improved status feedback.
+- 2025-10-22 (PDT): Added ADS bbox fetch UI with caching, CSV preview, and token-aware requests.
 - 2025-10-22 (PDT): Added token settings dialog with validation call and connected plugin actions.
 - 2025-10-22 (PDT): Scaffolded QGIS plugin package, metadata, and icon; established Obsidian build log.
 - 2025-10-22 (PDT): Initialized Obsidian note and set milestones.
